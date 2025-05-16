@@ -1,114 +1,103 @@
 #!/usr/bin/env python3
-import time, serial
+import time, serial, collections
 import numpy as np
 import matplotlib.pyplot as plt
 
 # — CONFIGURATION —
 PORT        = "/dev/cu.usbmodem175676601"
 BAUD        = 115200
-NUM_FRAMES  = 10        # you can set back to 100 once stable
+NUM_FRAMES  = 1000            # total frames to grab for final average/median
+ROLLING_N   = 100             # rolling-average window for live update
 WIDTH, HEIGHT = 32, 24
 PIXELS      = WIDTH * HEIGHT
-TIMEOUT_S   = 3.0       # per-frame timeout in seconds
+TIMEOUT_S   = 5.0             # per-frame timeout
 
-def grab_one_frame(ser, timeout_s=TIMEOUT_S):
-    """Read exactly PIXELS CSV lines (frame,row,col,temp) within timeout."""
-    sum_arr   = np.zeros((HEIGHT, WIDTH), dtype=float)
-    count_arr = np.zeros((HEIGHT, WIDTH), dtype=int)
-    start = time.time()
-
-    while count_arr.sum() < PIXELS:
-        if time.time() - start > timeout_s:
-            raise TimeoutError(f"Timed out after {timeout_s}s, got {count_arr.sum()} pixels")
-        line = ser.readline().decode('ascii', errors='ignore').strip()
-        if not line:
-            continue
-
+def read_raw_frame(ser, timeout_s=TIMEOUT_S):
+    """Read exactly PIXELS lines of CSV (frameID,row,col,temp)."""
+    data = np.full((HEIGHT, WIDTH), np.nan, dtype=float)
+    count = np.zeros((HEIGHT, WIDTH), dtype=int)
+    t0 = time.time()
+    while count.sum() < PIXELS:
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError(f"Timeout, got {count.sum()}/{PIXELS}")
+        line = ser.readline().decode(errors='ignore').strip()
+        if not line: continue
         parts = line.split(',')
-        if len(parts) != 4:
-            continue
-
+        if len(parts) != 4: continue
+        _, r, c, t = parts
         try:
-            _, r, c, t = parts
             r = int(r); c = int(c); t = float(t)
         except ValueError:
             continue
-
         if 0 <= r < HEIGHT and 0 <= c < WIDTH:
-            sum_arr[r, c]   += t
-            count_arr[r, c] += 1
+            # accumulate for possible multi-hits
+            if np.isnan(data[r,c]):
+                data[r,c] = t
+            else:
+                data[r,c] = (data[r,c] + t) / 2
+            count[r,c] += 1
+    return data
 
-    # compute per-pixel average
-    with np.errstate(divide='ignore', invalid='ignore'):
-        frame = sum_arr / count_arr
-        frame[np.isnan(frame)] = 0
-    return frame
+def robust_stats(frames):
+    """Given list of (H×W) arrays, do per-pixel 3σ outlier rejection
+       then compute mean and median maps."""
+    stack = np.stack(frames, axis=0)  # shape (N,H,W)
+    mean = stack.mean(axis=0)
+    std  = stack.std(axis=0)
+    # mask outliers > 3σ
+    mask = np.abs(stack - mean[None,:,:]) <= 3*std[None,:,:]
+    # for each pixel: collect only the non-outlier samples
+    cleaned = np.where(mask, stack, np.nan)
+    mean_clean = np.nanmean(cleaned, axis=0)
+    median_clean = np.nanmedian(cleaned, axis=0)
+    return mean_clean, median_clean
 
 def main():
-    # 1) Open serial and reset
     ser = serial.Serial(PORT, BAUD, timeout=1)
     time.sleep(2)
     ser.reset_input_buffer()
 
-    # 2) Countdown
-    print("Capture starts in:")
-    for i in range(5, 0, -1):
-        print(f"  {i}")
-        time.sleep(1)
-    print(f"Capturing {NUM_FRAMES} frames…")
+    # 1) Warm up rolling buffer
+    rolling = collections.deque(maxlen=ROLLING_N)
+    print(f"Collecting initial {ROLLING_N} frames for rolling buffer…")
+    for i in range(ROLLING_N):
+        rolling.append(read_raw_frame(ser))
 
-    # 3) Capture loop with timeout handling
-    frames = []
-    for n in range(1, NUM_FRAMES+1):
-        print(f" Frame {n}/{NUM_FRAMES} …", end='', flush=True)
-        try:
-            fm = grab_one_frame(ser)
-        except TimeoutError as e:
-            print(f"\n⚠️  {e}")
-            break
-        frames.append(fm)
-        print(" done")
+    # 2) Live-updating display of rolling average
+    plt.ion()
+    fig, ax = plt.subplots()
+    img = ax.imshow(np.zeros((HEIGHT,WIDTH)), origin='lower', aspect='auto')
+    cb = fig.colorbar(img, ax=ax, label='°C')
+    print("Live rolling-average display (press Ctrl+C to finish)…")
+    try:
+        while True:
+            frm = read_raw_frame(ser)
+            rolling.append(frm)
+            mean_roll = np.nanmean(np.stack(rolling), axis=0)
+            img.set_data(mean_roll)
+            ax.set_title(f"Rolling mean over last {len(rolling)} frames")
+            plt.pause(0.01)
+    except KeyboardInterrupt:
+        pass
+    plt.ioff()
+    print(f"\nNow capturing full batch of {NUM_FRAMES} frames…")
+    
+    # 3) Capture full set
+    batch = []
+    for n in range(NUM_FRAMES):
+        print(f" Frame {n+1}/{NUM_FRAMES}", end='\r')
+        batch.append(read_raw_frame(ser))
     ser.close()
 
-    if not frames:
-        print("No frames captured—exiting.")
-        return
+    # 4) Compute robust mean & median
+    mean_map, median_map = robust_stats(batch)
+    print("\nDisplaying final robust maps…")
 
-    # 4) Compute average map
-    avg_map = np.mean(frames, axis=0)
-
-    # 5) Interactive back/forward browsing
-    idx = 0
-    N   = len(frames)
-    print("\nBrowse frames: [n]ext, [p]revious, [q]uit")
-    while True:
-        plt.imshow(frames[idx], origin='lower', aspect='auto')
-        plt.title(f"Frame {idx+1}/{N}")
-        plt.colorbar(label='°C')
-        plt.pause(0.1)
-
-        cmd = input("Command (n/p/q): ").strip().lower()
-        plt.clf()
-        if cmd == 'n':
-            if idx < N-1:
-                idx += 1
-            else:
-                print("Already at last frame.")
-        elif cmd == 'p':
-            if idx > 0:
-                idx -= 1
-            else:
-                print("Already at first frame.")
-        elif cmd == 'q':
-            break
-        else:
-            print("Use 'n', 'p', or 'q'.")
-
-    # 6) Show average heat map
-    print("Displaying average of captured frames. Done.")
-    plt.imshow(avg_map, origin='lower', aspect='auto')
-    plt.title("Average Heat Map")
-    plt.colorbar(label='°C')
+    fig, axes = plt.subplots(1,2, figsize=(10,4))
+    for ax, data, title in zip(axes, (mean_map, median_map), ("Mean", "Median")):
+        im = ax.imshow(data, origin='lower', aspect='auto')
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, label='°C')
     plt.show()
 
 if __name__ == "__main__":

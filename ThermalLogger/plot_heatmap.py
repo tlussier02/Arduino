@@ -14,6 +14,7 @@ ser.reset_input_buffer()
 data = []
 first_id = None
 
+
 print("Reading one frame of data…")
 while True:
     raw = ser.readline().decode('ascii', errors='ignore').strip()
